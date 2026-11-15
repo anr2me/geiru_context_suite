@@ -1,5 +1,11 @@
 """Geiru Hybrid Windows (was Clowntext Hybrid Windows). Geiru Window Director plugs in after it (optional).
 
+Memory: the full-length copies of the video that are kept between window passes (state, clean guesses, starting
+latent and mask, snapshots, keystone, capstone) wait in system RAM and only go to the GPU when a pass needs them, and
+each window's own steps run on just that window (video and sound) instead of the whole video with the rest frozen.
+The math is the same, so the result is bit for bit what the full-length way gives; the GPU memory stays the size of
+one window however long the video is.
+
 One long MiniMax H3 render in overlapping windows, done the HybridWindows way (JalenBrunson's ComfyUI-HybridWindows,
 from the Rolling Diffusion paper), on top of kijai's MiniMax H3 context windows in ComfyUI (PR #17425,
 comfy/context_windows.py, GPL-3). What this node adds is the keystone and capstone.
@@ -18,10 +24,13 @@ steps: part of the current noise, fading to none at the join, instead of locking
 sound_first (off by default): the sound is rendered first on its own (blended windows on every step, picture at 64x64), then locked in,
 so the main render only makes the picture.
 
-The sampler itself is unchanged: it's re-run in short passes on the full latent, with everything outside the window
-being worked on frozen, so memory use stays at one window.
+keystone_attention (off by default): during each window's own steps, the keystone pulls harder than the overlap from
+the windows before (Geiru Keystone Attention's balance) on the chosen blocks (the 13 lighting blocks by default).
+
+The sampler itself is unchanged: it's re-run in short passes, one window at a time.
 """
 import copy
+import inspect
 import logging
 import os
 
@@ -35,6 +44,7 @@ import comfy.patcher_extension
 import comfy.utils
 
 from .nodes import _split
+from .hybrid_keystone_attention import add_keystone_attention, parse_blocks, _ranges, LIGHTING_BLOCKS, BLOCK_MODES as KA_BLOCK_MODES
 
 CATEGORY = "Geiru Context Suite"
 WHO = "Geiru Hybrid Windows"
@@ -164,6 +174,11 @@ class ClownContextHandler(cw.IndexListContextHandler):
         self.mask_conds = None               # model mask conds for the single-window pass
         self.context_noise = 0.0             # ethanfel's context noise on the pinned overlap (0 = off)
         self.context_noise_fade = "linear"   # linear / ease / ethanfel
+        self.system_ram = True               # the full-length copies wait in system RAM between passes
+        self.crop_windows = True             # each window's own pass runs on just that window
+        self.crop = None                     # set while a cropped pass runs: its shapes and spans
+        self.ka_slot = False                 # keystone attention: the keystone is locked in this pass's first slot
+        self.ka_len = 0                      # keystone attention: the window's length in video latents
 
     def _with_masks(self, cond_list):
         if cond_list is None or self.mask_conds is None:
@@ -181,9 +196,40 @@ class ClownContextHandler(cw.IndexListContextHandler):
             out.append(c2)
         return out
 
+    def should_use_context(self, model, conds, x_in, timestep, model_options):
+        if self.only_window is not None and self.crop is not None:
+            return True                      # a cropped window pass: the latent is shorter than a window's worth
+        return super().should_use_context(model, conds, x_in, timestep, model_options)
+
     def execute(self, calc_cond_batch, model, conds, x_in, timestep, model_options):
         if self.only_window is None:
             return super().execute(calc_cond_batch, model, conds, x_in, timestep, model_options)
+        crop = self.crop
+        if crop is None:
+            return self._execute_one(calc_cond_batch, model, conds, x_in, timestep, model_options)
+        # cropped pass: the sampler hands over just the window. Put it into a full-length latent for this model call
+        # (the conds are full length, and only the window's part is ever read), then cut the window back out.
+        full_shapes, run_shapes, spans = crop["full_shapes"], crop["shapes"], crop["spans"]
+        multi = len(full_shapes) > 1
+        dims = model.context_window_modality_dims(full_shapes, self.dim) if multi else [self.dim]
+        parts = list(comfy.utils.unpack_latents(x_in, run_shapes)) if multi else [x_in]
+        full = []
+        for mi, (p, (a, b)) in enumerate(zip(parts, spans)):
+            f = torch.zeros(tuple(full_shapes[mi]), dtype=p.dtype, device=p.device)
+            f.narrow(dims[mi], a, b - a).copy_(p)
+            full.append(f)
+        x_full = comfy.utils.pack_latents(full)[0] if multi else full[0]
+        del full, parts
+        outs = self._execute_one(calc_cond_batch, model, conds, x_full, timestep, model_options)
+        del x_full
+        res = []
+        for o in outs:
+            op = list(comfy.utils.unpack_latents(o, full_shapes)) if multi else [o]
+            cut = [op[mi].narrow(dims[mi], a, b - a) for mi, (a, b) in enumerate(spans)]
+            res.append(comfy.utils.pack_latents(cut)[0] if multi else cut[0].contiguous())
+        return res
+
+    def _execute_one(self, calc_cond_batch, model, conds, x_in, timestep, model_options):
         self._model = model
         self.set_step(timestep, model_options)
         # the model reads its keep mask from the conds (per-token timestep), so it must match this pass's mask
@@ -332,9 +378,16 @@ def _hybrid(executor, guider, sigmas, extra_args, callback, noise, latent_image,
     steps = len(sigmas) - 1
     k = max(1, min(int(h.switch_step), steps))
     nscale = float(getattr(ms, "noise_scale", 1.0))
-    base_parts = unpack(denoise_mask if denoise_mask is not None else torch.ones_like(latent_image))
-    clean_parts = unpack(latent_image)
-    st = unpack(ms.noise_scaling(sigmas[0], noise, latent_image))
+    work_dev = latent_image.device                           # where the sampler and its math run
+    # where the full-length copies wait between passes: system RAM (system_ram on) or the GPU (off, like the original)
+    store = torch.device("cpu") if getattr(h, "system_ram", True) else work_dev
+
+    def to_store(parts):
+        return [p.to(store) for p in parts]
+
+    base_parts = to_store(unpack(denoise_mask if denoise_mask is not None else torch.ones_like(latent_image)))
+    clean_parts = to_store(unpack(latent_image))
+    st = to_store(unpack(ms.noise_scaling(sigmas[0], noise, latent_image)))
     pins = [p.clone() for p in clean_parts]             # clean guess for each position, from the window that made it
     done = [set() for _ in shapes]
     per_window = [model.map_context_window_to_modalities(w, shapes, h.dim) if multi else [w] for w in windows]
@@ -354,6 +407,15 @@ def _hybrid(executor, guider, sigmas, extra_args, callback, noise, latent_image,
     counter = {"n": 0, "pass": 0}
     guess = {}
 
+    def full_view(t, c):
+        ps = list(comfy.utils.unpack_latents(t, c["shapes"])) if multi else [t]
+        full = []
+        for mi, (p, (a, b)) in enumerate(zip(ps, c["spans"])):
+            f = torch.zeros(tuple(c["full_shapes"][mi]), dtype=p.dtype, device=p.device)
+            f.narrow(dims[mi], a, b - a).copy_(p)
+            full.append(f)
+        return comfy.utils.pack_latents(full)[0] if multi else full[0]
+
     def progress():
         offset = counter["n"]
 
@@ -361,10 +423,43 @@ def _hybrid(executor, guider, sigmas, extra_args, callback, noise, latent_image,
             guess["x0"] = x0
             cap = getattr(h, "step_capture", None)        # Window Director's keep_late_steps
             if cap is not None:
-                cap.append(x.detach().clone())
+                take = getattr(h, "step_capture_fn", None)  # Window Director: just its window, straight to RAM
+                cap.append(take(x) if take is not None else x.detach().clone())
             if callback is not None:
-                callback(offset + step, x0, x, total_all)
+                c = h.crop
+                if c is None:
+                    callback(offset + step, x0, x, total_all)
+                else:
+                    # a cropped pass: previews expect the full length, so hand them the window in its place
+                    callback(offset + step, full_view(x0, c), full_view(x, c), total_all)
         return cb
+
+    def crop_spans(wi):
+        """The window's own stretch of each stream, if it's one unbroken run (else None = run on the full length)."""
+        spans = []
+        for mi in range(len(shapes)):
+            idx = sorted(per_window[wi][mi])
+            if not idx or idx != list(range(idx[0], idx[-1] + 1)):
+                return None
+            spans.append((idx[0], idx[-1] + 1))
+        return spans
+
+    def cut(parts, spans):
+        return [p.narrow(dims[mi], a, b - a) for mi, (p, (a, b)) in enumerate(zip(parts, spans))]
+
+    def pack_any(parts):
+        return comfy.utils.pack_latents(list(parts))[0] if multi else parts[0]
+
+    def unpack_any(t, shp):
+        return list(comfy.utils.unpack_latents(t, shp)) if multi else [t]
+
+    def put_back(base, part_list, spans):
+        """A full-length copy of `base` with the cropped window written back into place (only window positions
+        are ever read from it)."""
+        outp = [p.clone() for p in base]
+        for mi, (a, b) in enumerate(spans):
+            outp[mi].narrow(dims[mi], a, b - a).copy_(part_list[mi].to(device=outp[mi].device, dtype=outp[mi].dtype))
+        return outp
 
     def one_window(sig, wi, state, slot=None, slot_src=None):
         """Run window wi on sig from `state`. Pinned positions (done) are locked to their clean guess."""
@@ -388,39 +483,98 @@ def _hybrid(executor, guider, sigmas, extra_args, callback, noise, latent_image,
             li[0][:, :, slot:slot + 1] = slot_src.to(li[0].dtype)
             m[0][:, :, slot:slot + 1] = 0.0
             ramp = [(i, v) for i, v in ramp if i != slot]     # the keystone slot stays locked and clean
-        li_p, m_p = pack(li), pack(m)
         s0 = float(sig[0])
-        noise_w = (pack(state) - (1.0 - s0) * li_p) / (s0 * nscale)
+        args = _pass_args(extra_args, counter["pass"])
+        spans = crop_spans(wi) if h.crop_windows else None
+        if spans is not None and ramp and h.context_noise_fade == "ethanfel":
+            spans = None                                    # ethanfel's per-step ratio works on the full length
+        # the model reads its keep mask from the conds at full length, so that one is always built full length
+        m_full = pack(m).to(work_dev)
+        h.mask_conds = model._denoise_mask_values(m_full, shapes) if multi else {}
+        if spans is None:
+            li_p, m_p = pack(li).to(work_dev), m_full
+            state_p = pack(state).to(work_dev)
+            run_shapes = list(shapes)
+        else:
+            # cropped pass: the sampler only works on this window's stretch of the video and sound
+            del m_full
+            li_c, m_c, st_c = cut(li, spans), cut(m, spans), cut(state, spans)
+            run_shapes = [p.shape for p in li_c]
+            li_p, m_p = pack_any(li_c).to(work_dev), pack_any(m_c).to(work_dev)
+            state_p = pack_any(st_c).to(work_dev)
+            del li_c, m_c, st_c
+        del li, m
+        noise_w = (state_p - (1.0 - s0) * li_p) / (s0 * nscale)
+        del state_p
         if ramp:
             # the noised overlap latents need real noise, like any other noisy latent
-            nw = unpack(noise_w)
+            nw = unpack_any(noise_w, run_shapes)
+            nw = [p.clone() for p in nw]
+            off = 0 if spans is None else spans[0][0]
             g = torch.Generator(device="cpu").manual_seed(int(extra_args.get("seed", 0) or 0) + 104729 * (wi + 1))
-            sl = _ix(dims[0], [i for i, _ in ramp])
+            sl = _ix(dims[0], [i - off for i, _ in ramp])
             nw[0][sl] = torch.randn(nw[0][sl].shape, generator=g).to(device=nw[0].device, dtype=nw[0].dtype)
-            noise_w = pack(nw)
+            noise_w = pack_any(nw)
+            del nw
             if counter.get("noted") != wi:
                 counter["noted"] = wi
                 logging.info(f"[{WHO}] context noise on window {wi + 1}'s overlap: "
                              + ", ".join(f"latent {i} {v:.2f}" for i, v in ramp))
         h.only_window, h.window_subset = wi, None
-        h.mask_conds = model._denoise_mask_values(m_p, shapes) if multi else {}
+        h.ka_slot, h.ka_len = slot is not None, len(act[0])
         guess.pop("x0", None)
-        args = _pass_args(extra_args, counter["pass"])
         if ramp and h.context_noise_fade == "ethanfel":
             args = dict(args)
             mo2 = dict(args["model_options"])
             mo2["denoise_mask_function"] = _ratio_fn(mo2.get("denoise_mask_function"), ramp, dims[0], unpack, pack,
                                                      m_p.shape)
             args["model_options"] = mo2
+        ks = getattr(executor, "class_obj", None)
+        old_opts, old_shapes = None, None
+        if spans is not None:
+            h.crop = {"shapes": run_shapes, "spans": spans, "full_shapes": list(shapes)}
+            old_shapes = model.latent_shapes
+            if multi:
+                model.latent_shapes = list(run_shapes)     # the sampler unpacks the packed latent with these
+            # the same random noise as a full-length pass, cut to the window, so the result doesn't change
+            seed = args.get("seed", None)
+            fn = getattr(ks, "sampler_function", None)
+            if seed is not None and fn is not None and "noise_sampler" in inspect.signature(fn).parameters \
+                    and "noise_sampler" not in (ks.extra_options or {}):
+                full_shape = tuple(noise.shape)
+                gen = torch.Generator(device=work_dev)
+                gen.manual_seed(int(seed) + (1 if work_dev.type == "cpu" else 0))
+                ndt = noise_w.dtype
+
+                def window_noise(sigma, sigma_next, _spans=spans):
+                    full = torch.randn(full_shape, dtype=ndt, device=work_dev, generator=gen)
+                    sub = pack_any(cut(unpack_any(full, shapes), _spans))
+                    del full
+                    return sub.contiguous()
+                old_opts = ks.extra_options
+                ks.extra_options = {**(old_opts or {}), "noise_sampler": window_noise}
         try:
             out = executor(guider, sig, args, progress(), noise_w, li_p, m_p,
                            disable_pbar)
         finally:
-            h.only_window, h.window_subset, h.mask_conds = None, None, None
+            h.only_window, h.window_subset, h.mask_conds, h.crop = None, None, None, None
+            h.ka_slot, h.ka_len = False, 0
+            if old_opts is not None:
+                ks.extra_options = old_opts
+            if spans is not None:
+                model.latent_shapes = old_shapes
         counter["n"] += len(sig) - 1
         counter["pass"] += 1
-        x0 = unpack(guess["x0"]) if "x0" in guess else None
-        return unpack(out * (1.0 - float(sig[-1]))), x0
+        del noise_w, li_p, m_p
+        if spans is None:
+            x0 = to_store(unpack(guess["x0"])) if "x0" in guess else None
+            res = to_store(unpack(out * (1.0 - float(sig[-1]))))
+        else:
+            x0 = put_back(state, unpack_any(guess["x0"], run_shapes), spans) if "x0" in guess else None
+            res = put_back(state, unpack_any(out * (1.0 - float(sig[-1])), run_shapes), spans)
+        guess.pop("x0", None)
+        del out
+        return res, x0
 
     def run_win(a, b, wi, state, slot=None, slot_src=None):
         """Run window wi on steps a+1..b. The keystone (slot) is only locked in from keystone_step on: before that,
@@ -478,6 +632,14 @@ def _hybrid(executor, guider, sigmas, extra_args, callback, noise, latent_image,
         except Exception as e:
             logging.warning(f"[{WHO}] crash protection: couldn't save progress: {e}")
 
+    def view_parts(t):
+        """A sampler latent as (stream, offset) pairs: full length (offset 0), or the cropped window and where it starts."""
+        c = h.crop
+        if c is None:
+            return [(p, 0) for p in (list(comfy.utils.unpack_latents(t, shapes)) if multi else [t])]
+        ps = list(comfy.utils.unpack_latents(t, c["shapes"])) if multi else [t]
+        return [(p, a) for p, (a, _) in zip(ps, c["spans"])]
+
     director = (extra_args.get("model_options") or {}).get("geiru_window_director")
     if director is not None:
         from .window_director import run_directed
@@ -486,7 +648,10 @@ def _hybrid(executor, guider, sigmas, extra_args, callback, noise, latent_image,
                    pack=pack, unpack=unpack, run_win=run_win, one_window=one_window, keep=keep, counter=counter,
                    extra_args=extra_args, executor=executor, guider=guider, progress=progress,
                    disable_pbar=disable_pbar, nscale=nscale, ms=ms, latent_image=latent_image, noise=noise,
-                   ix=_ix, free_vram=_free_vram, pass_args=_pass_args, who=WHO, model=model)
+                   ix=_ix, free_vram=_free_vram, pass_args=_pass_args, who=WHO, model=model,
+                   dev=work_dev, store=store, to_store=to_store,
+                   unpack_view=(lambda t: list(comfy.utils.unpack_latents(t, shapes)) if multi else [t]),
+                   view_parts=view_parts)
         state = dict(st=st, pins=pins, done=done)
         try:
             return run_directed(director, api, state)
@@ -554,12 +719,12 @@ def _hybrid(executor, guider, sigmas, extra_args, callback, noise, latent_image,
             checkpoint(wi + 1)
         h.capstone = None
         if k >= steps:
-            result = pack(st) / max(1.0 - float(sigmas[-1]), 1e-8)
+            result = pack(st).to(work_dev) / max(1.0 - float(sigmas[-1]), 1e-8)
         else:
             logging.info(f"[{WHO}] hybrid: steps {k + 1}-{steps} blended over all {len(windows)} windows")
-            li_p, m_p = pack(clean_parts), pack(base_parts)
+            li_p, m_p = pack(clean_parts).to(work_dev), pack(base_parts).to(work_dev)
             sk = float(sigmas[k])
-            noise_w = (pack(st) - (1.0 - sk) * li_p) / (sk * nscale)
+            noise_w = (pack(st).to(work_dev) - (1.0 - sk) * li_p) / (sk * nscale)
             _free_vram()
             result = executor(guider, sigmas[k:], _pass_args(extra_args, counter["pass"]), progress(), noise_w, li_p,
                               m_p, disable_pbar)
@@ -694,8 +859,10 @@ class H3ClownHybridWindows:
                                                                   "with Conditioning Combine)."}),
             },
             "optional": {
-                "detail_latent": ("LATENT", {"tooltip": "Optional: use this latent's first latent as the keystone "
-                                                        "instead of window 1's finished frame 0."}),
+                "detail_latent": ("LATENT", {"tooltip": "🎈 Optional: use this latent's first latent as the keystone "
+                                                        "instead of window 1's finished frame 0. With Window Director "
+                                                        "the keystone is taken once, when window 1 is made, so changing "
+                                                        "this later does nothing for that take."}),
                 "crash_protection": ("BOOLEAN", {"default": True,
                                                  "tooltip": "Saves the progress after every window to "
                                                             "output/geiru_hybrid_progress/crash_protection.pt and clears "
@@ -712,6 +879,27 @@ class H3ClownHybridWindows:
                     "advanced": True}),
                 "keystone_step": ("INT", {"default": 0, "min": 0, "max": 200,
                                           "tooltip": "Steps before the keystone is locked in (late lock). 0 = locked from the first step (the usual keystone). 2 with switch_step 6 = locked for steps 3-6.",
+                    "advanced": True}),
+                "keystone_attention": ("BOOLEAN", {"default": False,
+                                                   "tooltip": "During each window's own steps, the keystone pulls harder "
+                                                              "than the overlap from the windows before (Geiru Keystone "
+                                                              "Attention's balance), on the chosen blocks. Holds the "
+                                                              "brightness and look of window 1. Needs keystone_swap. Off on "
+                                                              "the blend steps (there's no keystone there).",
+                    "advanced": True}),
+                "balance": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 100000.0, "step": 0.01, "round": 0.01,
+                                      "tooltip": "How hard the keystone pulls compared with the overlap. 1 = normal. "
+                                                 "The overlap gives up exactly what the keystone gains; the prompt, "
+                                                 "references, sound and new frames keep their normal share.",
+                    "advanced": True}),
+                "block_mode": (KA_BLOCK_MODES, {"default": "lighting blocks",
+                                                "tooltip": "lighting blocks = the 13 blocks found to carry brightness "
+                                                           "(31-33, 36-44, 47). custom blocks = type your own below.",
+                    "advanced": True}),
+                "blocks": ("STRING", {"default": LIGHTING_BLOCKS, "multiline": False,
+                                      "tooltip": "Which transformer blocks (0-49), for custom blocks. Ranges and single "
+                                                 "numbers, commas between: 31-33, 36-44, 47  or  31,32,33. Spaces don't "
+                                                 "matter.",
                     "advanced": True}),
                 "back_capstone": ("BOOLEAN", {"default": False,
                                               "tooltip": "Window 1's finished last single-frame latent is tacked onto the "
@@ -760,7 +948,8 @@ class H3ClownHybridWindows:
               back_capstone=False, capstone_step=4, fuse_method=cw.ContextFuseMethods.PYRAMID, freenoise=True,
               split_conds_to_windows=False, detail_latent=None, finished_handoff=False, sound_first=False,
               context_noise=False, keystone_step=0, context_noise_strength=1.0, context_noise_fade="linear",
-              crash_protection=True, **_old):
+              crash_protection=True, keystone_attention=False, balance=20.0, block_mode="lighting blocks",
+              blocks=LIGHTING_BLOCKS, **_old):
         if not _supported(model.model):
             raise RuntimeError(f"{WHO} needs a newer ComfyUI with MiniMax H3 context windows (PR #17425). Update ComfyUI.")
         length = _video_latent_t(context_length)
@@ -791,6 +980,22 @@ class H3ClownHybridWindows:
         handler.crash_protection = bool(crash_protection)
         m = model.clone()
         m.model_options["context_handler"] = handler
+        ka_blocks = parse_blocks(LIGHTING_BLOCKS if block_mode == "lighting blocks" else blocks)
+        ka_on = bool(keystone_attention) and bool(keystone_swap) and abs(float(balance) - 1.0) > 1e-6 and bool(ka_blocks)
+        handler.ka_settings = {"keystone_attention": ka_on, "balance": float(balance), "blocks": _ranges(ka_blocks)}
+        if keystone_attention and not keystone_swap:
+            print(f"[{WHO}] keystone_attention needs keystone_swap on - left off")
+        if ka_on:
+            def anchors(lt, _h=handler):
+                if _h.only_window is None or not _h.ka_slot:
+                    return None                      # blend steps, window 1, or before keystone_step: off
+                if lt is None:
+                    return []
+                out = [0]                            # the keystone sits in the window's first slot
+                if _h.capstone is not None and lt == _h.ka_len + 1:
+                    out.append(lt - 1)               # window 1's capstone, tacked on the back (locked)
+                return out
+            m = add_keystone_attention(m, float(balance), ka_blocks, anchors)
         if handler.back_capstone:
             m.set_model_unet_function_wrapper(_make_capstone_wrapper(handler, m.model_options.get("model_function_wrapper")))
         cw.create_prepare_sampling_wrapper(m)
@@ -805,9 +1010,11 @@ class H3ClownHybridWindows:
               + (", sound first" if sound_first else "")
               + (f", context noise {float(context_noise_strength):.2f} {handler.context_noise_fade}"
                  if handler.context_noise > 0 else "")
-              + (", crash protection" if crash_protection else ""))
+              + (", crash protection" if crash_protection else "")
+              + (f", keystone attention x{float(balance):g} on {_ranges(ka_blocks)}" if ka_on else ""))
         return (m,)
 
 
 NODE_CLASS_MAPPINGS = {"H3ClownHybridWindows": H3ClownHybridWindows}
 NODE_DISPLAY_NAME_MAPPINGS = {"H3ClownHybridWindows": "Geiru Hybrid Windows"}
+

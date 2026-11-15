@@ -122,29 +122,36 @@ def run_directed(d, api, state):
     run_win, one_window, keep = api["run_win"], api["one_window"], api["keep"]
     counter, extra_args, ms = api["counter"], api["extra_args"], api["ms"]
     st, pins, done = state["st"], state["pins"], state["done"]
+    work_dev, store, view_parts = api["dev"], api["store"], api["view_parts"]   # math on the GPU, copies in RAM
     n = len(windows)
     name = d.get("run_name", "run")
     folder = _run_dir(name)
 
     handoff_on = bool(getattr(h, "finished_handoff", False))
+    # what must stay the same for the whole take (🎈 on the nodes). The keystone, keystone attention, capstone and
+    # context noise settings can change between windows: they only change the windows made after the change.
     sig = {"shapes": [list(map(int, s)) for s in shapes], "windows": [list(map(int, w)) for w in windows],
-           "sigmas": [round(float(x), 5) for x in sigmas], "keystone": bool(h.detail_swap),
-           "capstone": bool(h.back_capstone), "handoff": handoff_on}
+           "sigmas": [round(float(x), 5) for x in sigmas], "handoff": handoff_on,
+           "split": bool(getattr(h, "split_conds_to_windows", False)), "sound_first": bool(getattr(h, "sound_first", False))}
     meta = _read_meta(folder)
     if meta is not None and "k" in (meta.get("sig") or {}):          # a take saved before switch_step moved out
         meta["k"] = int(meta["sig"].pop("k"))
     if meta is None or not meta.get("sig"):
         meta = {"sig": sig, "k": int(k), "total": n, "approved": 0, "pending": 0, "rerolls": {}, "blended": False}
-    elif meta["sig"] != sig:
+    else:
         old = meta["sig"]
         what = [label for key, label in (("shapes", "the length or size"), ("windows", "the window length or overlap"),
-                                         ("sigmas", "the steps or scheduler"), ("keystone", "keystone_swap"),
-                                         ("capstone", "back_capstone"), ("handoff", "finished_handoff"))
-                if old.get(key) != sig.get(key)]
-        msg = (f"'{name}' was made with different settings ({', '.join(what) or 'settings'} changed). Set them back, "
-               f"or press Reset to start a new take")
-        _send(_status(meta, name, msg))
-        raise RuntimeError(f"{WHO}: {msg}.")
+                                         ("sigmas", "the steps or scheduler"), ("handoff", "finished_handoff"),
+                                         ("split", "split_conds_to_windows"), ("sound_first", "sound_first"))
+                if key in old and old.get(key) != sig.get(key)]     # a take saved before a key existed: not checked
+        if what:
+            msg = (f"'{name}' was made with different settings ({', '.join(what)} changed). Set them back, "
+                   f"or press Reset to start a new take")
+            _send(_status(meta, name, msg))
+            raise RuntimeError(f"{WHO}: {msg}.")
+        meta["sig"] = {**old, **sig}
+        for gone in ("keystone", "capstone"):                        # no longer fixed
+            meta["sig"].pop(gone, None)
     meta["total"] = n
     k_take = int(meta.get("k", k))                 # the switch_step the windows were made at
 
@@ -191,8 +198,9 @@ def run_directed(d, api, state):
             for mi in range(len(shapes)):
                 if new[mi]:
                     sl = ix(dims[mi], new[mi])
-                    fresh = torch.randn(st[mi][sl].shape, generator=g).to(device=st[mi].device, dtype=st[mi].dtype)
-                    st[mi][sl] = ms.noise_scaling(sigmas[0], fresh, clean_parts[mi][sl].to(st[mi].device)).to(st[mi].dtype)
+                    fresh = torch.randn(st[mi][sl].shape, generator=g).to(device=work_dev, dtype=st[mi].dtype)
+                    st[mi][sl] = ms.noise_scaling(sigmas[0], fresh, clean_parts[mi][sl].to(work_dev)).to(
+                        device=store, dtype=st[mi].dtype)
         counter["pass"] = keys["pass"] + 9973 * reroll
         h.capstone, slot = None, None
         if wi > 0:
@@ -213,6 +221,10 @@ def run_directed(d, api, state):
                 snap[mi][sl] = out[mi][sl].to(snap[mi].dtype)
             if handoff_on and d.get("keep_late_steps", False):
                 capture = []
+                # each step: only the latents this window makes, copied straight to system RAM
+                h.step_capture_fn = lambda x, _new=new: [
+                    v[ix(dims[mi], [i - off for i in _new[mi]])].detach().to(store) if _new[mi] else torch.zeros(0)
+                    for mi, (v, off) in enumerate(view_parts(x))]
             h.step_capture = capture
             try:
                 if wi == 0:
@@ -221,6 +233,7 @@ def run_directed(d, api, state):
                     fin, _ = run_win(kk, steps, wi, snap, slot, keys["key"])
             finally:
                 h.step_capture = None
+                h.step_capture_fn = None
             del snap
         elif kk < steps:
             fin = None
@@ -237,6 +250,11 @@ def run_directed(d, api, state):
         keep(wi, out, fin if (handoff_on and kk < steps) else x0)
         h.capstone = None
         save = {"idx": new, "st": [], "pins": [], "preview": [], "pass": int(counter["pass"])}
+        settings = {"reroll": int(reroll), "keystone_swap": bool(h.detail_swap), "keystone_step": int(h.keystone_step),
+                    "back_capstone": bool(h.back_capstone), "capstone_step": int(h.capstone_step),
+                    "context_noise": float(h.context_noise), "context_noise_fade": str(h.context_noise_fade),
+                    **(getattr(h, "ka_settings", None) or {})}
+        meta.setdefault("window_settings", {})[str(t)] = settings
         for mi in range(len(shapes)):
             if new[mi]:
                 sl = ix(dims[mi], new[mi])
@@ -258,9 +276,7 @@ def run_directed(d, api, state):
                 si = kk + i
                 if si <= kk or si >= steps:
                     continue
-                xp = unpack(x)
-                late[str(si)] = [xp[mi][ix(dims[mi], new[mi])].detach().cpu() if new[mi] else torch.zeros(0)
-                                 for mi in range(len(shapes))]
+                late[str(si)] = x                     # already just this window's latents, in system RAM
             save["late"] = late
         p = _win_path(folder, t)
         torch.save(save, p + ".tmp")
@@ -282,10 +298,10 @@ def run_directed(d, api, state):
         ls = getattr(api.get("model"), "latent_shapes", None)
         if len(parts) > 1:
             if not (isinstance(ls, list) and len(ls) == len(parts)):
-                return pack(preview)                      # can't resize safely: whole length
+                return pack(preview).to(work_dev)         # can't resize safely: whole length
             for i, p in enumerate(parts):
                 ls[i] = p.shape
-        return pack(parts)
+        return pack(parts).to(work_dev)
 
     action = d.get("action", "reroll")
     approved, pending = int(meta["approved"]), int(meta["pending"])
@@ -332,15 +348,15 @@ def run_directed(d, api, state):
             meta.update(approved=n, pending=0, blended=True, joined=True)
             _write_meta(folder, meta)
             _send(_status(meta, name, "joined without blending"))
-            return pack(preview)
+            return pack(preview).to(work_dev)
         logging.info(f"[{WHO}] '{name}': all {n} windows approved - blending steps {k + 1}-{steps} over the whole video")
         h.capstone = None
         if k >= steps:
-            result = pack(st) / max(1.0 - float(sigmas[-1]), 1e-8)
+            result = pack(st).to(work_dev) / max(1.0 - float(sigmas[-1]), 1e-8)
         else:
-            li_p, m_p = pack(clean_parts), pack(base_parts)
+            li_p, m_p = pack(clean_parts).to(work_dev), pack(base_parts).to(work_dev)
             sk = float(sigmas[k])
-            noise_w = (pack(st) - (1.0 - sk) * li_p) / (sk * api["nscale"])
+            noise_w = (pack(st).to(work_dev) - (1.0 - sk) * li_p) / (sk * api["nscale"])
             api["free_vram"]()
             result = api["executor"](api["guider"], sigmas[k:], api["pass_args"](extra_args, keys["pass"] + 1),
                                      api["progress"](), noise_w, li_p, m_p, api["disable_pbar"])
@@ -414,7 +430,8 @@ class GeiruWindowDirector:
                                                               "it comes out different each time. Off: the same noise, so "
                                                               "it only changes if you change its prompt or the seed."}),
                 "keep_late_steps": ("BOOLEAN", {"default": False,
-                                                "tooltip": "Also save every step after switch_step for each window "
+                                                "tooltip": "🎈 Keep it the same for the whole take: only windows made "
+                                                           "while it's on have their later steps saved. Also save every step after switch_step for each window "
                                                            "(needs finished_handoff on). Then, once every window is "
                                                            "made, you can raise switch_step on Hybrid Windows "
                                                            "and Blend all starts from that later step, "

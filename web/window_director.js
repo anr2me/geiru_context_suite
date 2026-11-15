@@ -247,6 +247,7 @@ app.registerExtension({
       this.bgcolor = BODY_PINK;
       hideWidget(W(this, "action"));
       hideWidget(W(this, "rewind_to_window"));
+      { const kls = W(this, "keep_late_steps"); if (kls) kls.label = "\u{1F388} keep_late_steps"; }   // 🎈 = same for the whole take
       const root = document.createElement("div");
       root.className = "gwd";
       const mk = (label, tip) => { const b = document.createElement("button"); b.textContent = label; b.title = tip; return b; };
@@ -328,6 +329,7 @@ app.registerExtension({
       }
       hideWidget(W(this, "action"));
       hideWidget(W(this, "rewind_to_window"));
+      { const kls = W(this, "keep_late_steps"); if (kls) kls.label = "\u{1F388} keep_late_steps"; }   // 🎈 = same for the whole take
       if (this._gwd) { this._gwd.awaiting = false; refresh(this); }
       // a node saved while it was growing: bring it back down to what it needs, once it's laid out
       const shrink = (tries) => requestAnimationFrame(() => {
