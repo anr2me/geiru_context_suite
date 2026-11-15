@@ -88,7 +88,7 @@ class GeiruKeystoneAttention:
             "latent": ("LATENT", {"tooltip": "Geiru Keystone's av_latent output. Tells this node which latents are "
                                              "the keystone (and capstone) and whether degradation protection is on. "
                                              "Only read: the latent still goes from Keystone to the sampler as before."}),
-            "balance": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 100000.0, "step": 0.01, "round": 0.01,
+            "balance": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 100000.0, "step": 0.01, "round": 0.01,
                 "tooltip": "How the slice shared by the keystone and the carried context is split. 1 = normal. "
                            "2 = the keystone pulls twice as hard compared with the context, and the context gives up "
                            "exactly what the keystone gains. Every other slice (prompt, references, audio, new "
