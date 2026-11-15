@@ -323,6 +323,7 @@ I'm a clown and I'm ridiculous. My workflow names are equally so. The names can 
 |---|---|
 | Mad Clown Inventor | `long_chain_keystone_and_late_lock` |
 | Noisy Clown | `long_chain_plus_context_noise` |
+| Easily Distracted Clown | `long_chain_keystone_attention_and_context_noise` |
 | Clown Coaster | `hybrid_windows_60_second_simple` |
 | Clowns for Picard | `hybrid_windows_60_second_widescreen` |
 | everyone_wants_a_piece_of_the_clown | `motion_context_chain_cntxt_and_anchors` |
@@ -345,6 +346,10 @@ Late Lock puts the real frame back, so join the clips the normal way (see [Joini
 ### Noisy Clown example
 
 `example_workflows/noisy_clown_example.json` is the Mad Clown Inventor workflow with **Geiru Context Noise** added, so you can try the full degradation protection set: Geiru Context → Geiru Context Noise → Geiru Keystone → Geiru Late Lock → sampler, with the model plugged through Context Noise and Late Lock. Context Noise is at 1, which tested best in the [fade and strength sweep](https://github.com/roycho87/NerdNotes/blob/main/20261101/frame0_conclusions.md). If the scene cuts, first try prompting more deliberately; turning the noise down to 0.8 is optional, but it may make degradation progress faster. Use it the same way as Mad Clown Inventor, and flip `degradation_protection` off around cuts and scene changes.
+
+### Easily Distracted Clown example
+
+`example_workflows/easily_distracted_clown.json` is the Noisy Clown chain with **Geiru Keystone Attention** in place of Late Lock: Geiru Context → Geiru Context Noise → Geiru Keystone (`keystone front`) → sampler, with the model plugged through Context Noise, Keystone and Keystone Attention to the guider. Keystone Attention makes the keystone pull harder than the carried context on the lighting blocks (balance 20), to hold clip 1's brightness down a long chain. Use it the same way as Mad Clown Inventor, and flip `degradation_protection` off around cuts and scene changes.
 
 ### Clown Coaster example
 
